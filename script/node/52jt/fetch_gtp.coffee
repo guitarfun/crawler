@@ -4,7 +4,9 @@ http = require('http')
 cheerio = require('cheerio')
 fs = require("fs")
 Q = require('q')
-url = require('url')
+throat = require('throat')(Q)
+limitConcurrency = require("../common/limit_concurrency").limitConcurrency
+
 
 baseDir = path.join(path.dirname(__filename), "../../../")
 
@@ -23,9 +25,9 @@ if typeof String.prototype.endsWith != 'function'
 
 getLinksFromList = (content)->
   $ = cheerio.load(content)
-  $("#singer_content a.graya12").map((index, ele)->
-    return {'link': $(ele).attr('href'), 'name': $(ele).text().trim()}
-  )
+  $("#singer_content #gtp_detail a.graya12").map((index, ele)->
+    {'link': $(ele).attr('href'), 'name': $(ele).text().trim()}
+  ).get()
 
 
 fetchArtist = (id) ->
@@ -41,16 +43,21 @@ fetchArtist = (id) ->
       regExp = /共(\d+)页/
       match = regExp.exec(content)
       if match?.length != 2
-        deferred.reject(id)
+        logger.error("Pagination format error")
+        deferred.reject()
         return
-      totalPage = match[1]
-      if parseInt(totalPage) == 0
-        deferred.reject(null)
+      totalPage = parseInt(match[1])
+      logger.info("Total page:" + totalPage)
+
+      if totalPage == 0
+        logger.info("Empty artist")
+        deferred.reject()
       $ = cheerio.load(content)
       artistName = $("#singer_title strong").text()
-      if parseInt(totalPage) == 1
+      if totalPage == 1
         deferred.resolve([artistName, getLinksFromList(content)])
       else
+        links = getLinksFromList(content)
         processedCount = 1
         for i in [2..totalPage]
           http.get("http://www.52jt.net/singer-list.asp?/gtp_" + id + "_" + i + ".html", (res)->
@@ -68,37 +75,43 @@ fetchArtist = (id) ->
     ))
   .on('error', (err)->
     logger.error(err)
-    deferred.reject(id))
-  deferred.promise
+    deferred.reject())
+  deferred.promise.timeout(60000)
 
-extractDownloadPages = ([artistName,links])->
-  promises = for link in links
-    deferred = Q.defer()
-    do (link, deferred)->
-      pageLink = link['link']
-      filename = link['name']
-      http.get(pageLink, (res)->
-        content = ''
-        res.on('data', (data)-> content += data)
-        res.on('end', ->
-          $ = cheerio.load(content)
-          downLoadLink = $("#gtp_content a.graya16").attr("href")
-          download(downLoadLink, filename, artistName)
-          .then(-> deferred.reslove())
-          .fail('error',
-            (downloadLink)->
-              logger.error("Download error:" + downloadLink)
-              deferred.reject()
-          )
-        )
-      ).on('error', (err)->
-        logger.error(err)
-        logger.error("Process error:" + link)
+
+extractDownloadPages = (artistName, links)->
+  throatPromise = limitConcurrency((link)->
+    pageLink = link['link']
+    filename = link['name']
+    extractDownloadLink(pageLink)
+    .then((downloadLink)-> download(downloadLink, filename, artistName))
+    .catch((err)->
+      logger.error("Process error:" + pageLink)
+      logger.error(err) if err?)
+  , 10)
+  promises = (throatPromise(link) for link in links)
+  Q.allSettled(promises)
+
+
+extractDownloadLink = (link)->
+  deferred = Q.defer()
+  content = ''
+  http.get(link, (res)->
+    content = ''
+    res.on('data', (data)-> content += data)
+    res.on('end', ->
+      $ = cheerio.load(content)
+      downLoadLink = $("#gtp_content a.graya16").attr("href")
+      if not downLoadLink
         deferred.reject()
-      )
-    deferred.promise
-  Q.all(promises)
-
+      else
+        deferred.resolve(downLoadLink)
+    )
+  ).on('error', (err)->
+    logger.error(err)
+    deferred.reject()
+  )
+  deferred.promise.timeout(30000)
 
 download = (downloadLink, filename, artistName) ->
   deferred = Q.defer()
@@ -106,38 +119,34 @@ download = (downloadLink, filename, artistName) ->
   index = downloadLink.lastIndexOf(".")
   extension = downloadLink.substr(index)
   filename = filename + extension
-  requestTimer = setTimeout(->
-    req.abort()
-    logger.error('Request timeout : ' + downloadLink)
-    deferred.reject(downloadLink)
-  , 20000)
-  req = http.get(downloadLink, (res)->
+  http.get(downloadLink, (res)->
     buf = new Buffer(1024)
     res.on('data', (data)->
       buf = Buffer.concat([buf, data])
     )
     res.on("end", ->
-      clearTimeout(requestTimer)
       outputPath = path.join(baseDir, "data", "52jt", "gtp", artistName, filename)
       outputDir = path.join(baseDir, "data", "52jt", "gtp", artistName)
       if not fs.existsSync(outputDir)
         fs.mkdirSync(outputDir)
-      fs.writeFileSync(outputPath, buf)
-      deferred.resolve()
+      fs.writeFile(outputPath, buf, (err)->
+        if err?
+          logger.error(err)
+          return
+        deferred.resolve()
+      )
     )
   )
   .on('error', (err)->
     logger.error(err)
-    deferred.reject(downloadLink)
+    deferred.reject()
   )
-  deferred.promise
+  deferred.promise.timeout(30000)
 
 
 plan = Q()
-for index in [1..1]
-  do (index)->
-    plan = plan.then(-> fetchArtist(index))
-    .fail((id)-> logger.error("Fetch artist error : " + id))
-    .then(extractDownloadPages)
+for index in [217..6000]
+  plan = plan.then(fetchArtist.bind(null, index)).spread(extractDownloadPages).catch((ex)->logger.info(ex) if ex?)
+plan.done()
 
 

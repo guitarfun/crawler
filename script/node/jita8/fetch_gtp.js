@@ -44,23 +44,34 @@
       return res.on('end', function() {
         return deferred.resolve(content);
       });
-    }).on('error', function() {
-      return deferred.reject(page);
+    }).on('error', function(err) {
+      logger.error(err);
+      return deferred.reject();
     });
-    return deferred.promise;
+    return deferred.promise.timeout(60000);
   };
 
   processListContent = function(content) {
-    var $, processors;
+    var $, ele, processors;
     $ = cheerio.load(content);
-    processors = $('td.style156 a').map(function(index, ele) {
-      return extractFileLink("http://jitapu.jita8.com/" + $(ele).attr('href'), $(ele).text()).fail(function(link) {
-        return logger.error("Extract link error: " + link);
-      }).then(download).fail(function(link) {
-        return logger.error("Download error: " + link);
-      });
-    });
-    return Q.all(processors);
+    processors = (function() {
+      var i, len, ref, results;
+      ref = $('td.style156 a').get();
+      results = [];
+      for (i = 0, len = ref.length; i < len; i++) {
+        ele = ref[i];
+        results.push((function(ele) {
+          return extractFileLink("http://jitapu.jita8.com/" + $(ele).attr('href'), $(ele).text()).spread(download)["catch"](function(err) {
+            if (err != null) {
+              logger.error(err);
+            }
+            return logger.error("Error processing:" + $(ele).attr('href'));
+          });
+        })(ele));
+      }
+      return results;
+    })();
+    return Q.allSettled(processors);
   };
 
   extractFileLink = function(link, name) {
@@ -77,27 +88,27 @@
         regExp = /javascript:mm\('(.+?)'/;
         match = regExp.exec(content);
         if ((match != null ? match.length : void 0) !== 2) {
-          deferred.reject(link);
+          deferred.reject();
           return;
         }
         downloadLink = match[1];
         return deferred.resolve([downloadLink, name]);
       });
-    }).on('error', function() {
-      return deferred.reject(link);
+    }).on('error', function(err) {
+      logger.error(err);
+      return deferred.reject();
     });
-    return deferred.promise;
+    return deferred.promise.timeout(60000);
   };
 
-  download = function(arg) {
-    var deferred, downloadLink, name, req, requestTimer;
-    downloadLink = arg[0], name = arg[1];
+  download = function(downloadLink, name) {
+    var deferred, req, requestTimer;
     deferred = Q.defer();
     logger.info("Downloading " + downloadLink);
     requestTimer = setTimeout(function() {
       req.abort();
       logger.error('Request timeout : ' + downloadLink);
-      return deferred.reject(downloadLink);
+      return deferred.reject();
     }, 20000);
     req = http.get(encodeURI(downloadLink), function(res) {
       var buf;
@@ -112,18 +123,21 @@
         fs.writeFileSync(outputPath, buf);
         return deferred.resolve();
       });
-    }).on('error', function() {
-      return deferred.reject(downloadLink);
+    }).on('error', function(err) {
+      logger.error(err);
+      return deferred.reject();
     });
-    return deferred.promise;
+    return deferred.promise.timeout(60000);
   };
 
   plan = Q();
 
   for (index = i = 1131; i <= 1422; index = ++i) {
-    plan = plan.then(fetchList.bind(null, index)).fail(function(page) {
-      return logger.error("Fetch list error. Page : " + page);
-    }).then(processListContent);
+    plan = plan.then(fetchList.bind(null, index)).then(processListContent)["catch"](function(err) {
+      if (err != null) {
+        return logger.error(err);
+      }
+    });
   }
 
 }).call(this);

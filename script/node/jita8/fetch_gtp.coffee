@@ -24,17 +24,21 @@ fetchList = (page) ->
     content = ''
     res.on('data', (data)-> content += iconv.decode(data, "GBK"))
     res.on('end', -> deferred.resolve(content))
-  ).on('error', -> deferred.reject(page))
-  deferred.promise
+  ).on('error', (err)->
+    logger.error(err)
+    deferred.reject())
+  deferred.promise.timeout(60000)
 
 processListContent = (content)->
   $ = cheerio.load(content)
-  processors = $('td.style156 a').map((index, ele)->
-    extractFileLink("http://jitapu.jita8.com/" + $(ele).attr('href'), $(ele).text())
-    .fail((link)-> logger.error("Extract link error: " + link))
-    .then(download)
-    .fail((link)-> logger.error("Download error: " + link)))
-  Q.all(processors)
+  processors = for ele in $('td.style156 a').get()
+    do (ele)->
+      extractFileLink("http://jitapu.jita8.com/" + $(ele).attr('href'), $(ele).text())
+      .spread(download).catch((err)->
+        logger.error(err) if err?
+        logger.error("Error processing:" + $(ele).attr('href'))
+      )
+  Q.allSettled(processors)
 
 
 extractFileLink = (link, name)->
@@ -46,21 +50,23 @@ extractFileLink = (link, name)->
       regExp = /javascript:mm\('(.+?)'/
       match = regExp.exec(content)
       if match?.length != 2
-        deferred.reject(link)
+        deferred.reject()
         return
       downloadLink = match[1]
       deferred.resolve([downloadLink, name]))
-  ).on('error', -> deferred.reject(link))
-  deferred.promise
+  ).on('error', (err)->
+    logger.error(err)
+    deferred.reject())
+  deferred.promise.timeout(60000)
 
 
-download = ([downloadLink, name]) ->
+download = (downloadLink, name) ->
   deferred = Q.defer()
   logger.info("Downloading " + downloadLink)
   requestTimer = setTimeout(->
     req.abort()
     logger.error('Request timeout : ' + downloadLink)
-    deferred.reject(downloadLink)
+    deferred.reject()
   , 20000)
   req = http.get(encodeURI(downloadLink), (res)->
     buf = new Buffer(1024)
@@ -74,14 +80,17 @@ download = ([downloadLink, name]) ->
       deferred.resolve()
     )
   )
-  .on('error', -> deferred.reject(downloadLink))
-  deferred.promise
+  .on('error', (err)->
+    logger.error(err)
+    deferred.reject())
+  deferred.promise.timeout(60000)
 
 
 plan = Q()
 for index in [1131..1422]
   plan = plan.then(fetchList.bind(null, index))
-  .fail((page)-> logger.error("Fetch list error. Page : " + page))
   .then(processListContent)
+  .catch((err)-> logger.error(err) if err?)
+
 
 
